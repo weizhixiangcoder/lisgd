@@ -10,6 +10,7 @@
 #include <sys/select.h>
 #include <time.h>
 #include <unistd.h>
+#include <X11/Xlib.h>
 
 /* Defines */
 #define MAXSLOTS 20
@@ -26,11 +27,26 @@ enum {
   SwipeURDL,
   SwipeULDR
 };
-
 typedef int Swipe;
+
+enum {
+	AnyEdge,
+	NoEdge,
+	LeftEdge,
+	RightEdge,
+	TopEdge,
+	BottomEdge,
+	TopLeftCorner,
+	TopRightCorner,
+	BottomLeftCorner,
+	BottomRightCorner,
+};
+typedef int Edge;
+
 typedef struct {
 	int nfswipe;
 	Swipe swipe;
+	Edge edge;
 	char *command;
 } Gesture;
 
@@ -41,9 +57,13 @@ typedef struct {
 Gesture *gestsarr;
 int gestsarrlen;
 Swipe pendingswipe;
+Edge pendingedge;
 double xstart[MAXSLOTS], xend[MAXSLOTS], ystart[MAXSLOTS], yend[MAXSLOTS];
 unsigned nfdown = 0, nfpendingswipe = 0;
 struct timespec timedown;
+static Display *dpy;
+static int screen;
+static int screenwidth, screenheight;
 
 void
 die(char * msg)
@@ -91,31 +111,69 @@ gesturecalculateswipe(double x0, double y0, double x1, double y1) {
 	return -1;
 }
 
+Edge
+gesturecalculateedge(double x0, double y0, double x1, double y1) {
+		Edge horizontal = NoEdge;
+		Edge vertical = NoEdge;
+		if (x0 <= edgesize_x) {
+			horizontal = LeftEdge;
+		} else if (x0 >= screenwidth - edgesize_x) {
+			horizontal = RightEdge;
+		} else if (x1 <= edgesize_x) {
+			horizontal = LeftEdge;
+		} else if (x1 >= screenwidth - edgesize_x) {
+			horizontal = RightEdge;
+		}
+		if (y0 <= edgesize_y) {
+			vertical = TopEdge;
+		} else if (y0 >= screenheight - edgesize_y) {
+			vertical = BottomEdge;
+		} else if (y1 <= edgesize_y) {
+			vertical = TopEdge;
+		} else if (y1 >= screenheight - edgesize_y) {
+			vertical = BottomEdge;
+		}
+		if (horizontal == LeftEdge && vertical == TopEdge) {
+			return TopLeftCorner;
+		} else if (horizontal == RightEdge && vertical == TopEdge) {
+			return TopRightCorner;
+		} else if (horizontal == LeftEdge && vertical == BottomEdge) {
+			return BottomLeftCorner;
+		} else if (horizontal == RightEdge && vertical == BottomEdge) {
+			return BottomRightCorner;
+		} else if (horizontal != NoEdge) {
+			return horizontal;
+		} else {
+			return vertical;
+		}
+}
+
 void
-gestureexecute(Swipe swipe, int nfingers) {
+gestureexecute(Swipe swipe, int nfingers, Edge edge) {
 	int i;
 
 	for (i = 0; i < gestsarrlen; i++) {
 		if (verbose) {
-			fprintf(stderr, 
-				"[Nfswipe/SwipeId]: Cfg (%d/%d) <=> Evt (%d/%d)\n", 
-				gestsarr[i].nfswipe, gestsarr[i].swipe, nfingers, swipe
+			fprintf(stderr,
+				"[Nfswipe/SwipeId]: Cfg (%d/%d/%d) <=> Evt (%d/%d/%d)\n",
+				gestsarr[i].nfswipe, gestsarr[i].swipe, gestsarr[i].edge, nfingers, swipe, edge
 			);
 		}
-		if (gestsarr[i].nfswipe == nfingers && gestsarr[i].swipe == swipe) {
+		if (gestsarr[i].nfswipe == nfingers && gestsarr[i].swipe == swipe
+			&& (gestsarr[i].edge == AnyEdge || gestsarr[i].edge == edge)) {
 			if (verbose) fprintf(stderr, "Execute %s\n", gestsarr[i].command);
 			execcommand(gestsarr[i].command);
 		}
 	}
 }
 
-static int 
+static int
 libinputopenrestricted(const char *path, int flags, void *user_data)
 {
 	int fd = open(path, flags);
 	return fd < 0 ? -errno : fd;
 }
- 
+
 static void
 libinputcloserestricted(int fd, void *user_data)
 {
@@ -139,6 +197,25 @@ swipereorient(Swipe swipe, int orientation) {
 		orientation--;
 	}
 	return swipe;
+}
+
+Edge
+edgereorient(Edge edge, int orientation) {
+	while (orientation > 0) {
+		switch(edge) {
+			// 90deg per turn
+			case LeftEdge:   edge = TopEdge; break;
+			case RightEdge:  edge = BottomEdge; break;
+			case TopEdge:    edge = RightEdge; break;
+			case BottomEdge: edge = LeftEdge; break;
+			case TopLeftCorner: edge = TopRightCorner; break;
+			case TopRightCorner:   edge = BottomRightCorner; break;
+			case BottomLeftCorner: edge = TopLeftCorner; break;
+			case BottomRightCorner: edge = BottomLeftCorner; break;
+		}
+		orientation--;
+	}
+	return edge;
 }
 
 void
@@ -197,17 +274,23 @@ touchup(struct libinput_event *e)
 	Swipe swipe = gesturecalculateswipe(
 		xstart[slot], ystart[slot], xend[slot], yend[slot]
 	);
-	if (nfpendingswipe == 0) pendingswipe = swipe;
+	Edge edge = gesturecalculateedge(
+		xstart[slot], ystart[slot], xend[slot], yend[slot]
+	);
+	if (nfpendingswipe == 0) {
+		pendingswipe = swipe;
+		pendingedge = edge;
+	}
 	if (pendingswipe == swipe) nfpendingswipe++;
 	resetslot(slot);
 
 	// All fingers up - check if within milisecond limit, exec, & reset
 	if (nfdown == 0) {
 		if (
-			timeoutms > 
+			timeoutms >
 			((now.tv_sec - timedown.tv_sec) * 1000000 + (now.tv_nsec - timedown.tv_nsec) / 1000) / 1000
-		) gestureexecute(swipe, nfpendingswipe);
-		
+		) gestureexecute(swipe, nfpendingswipe, edge);
+
 		nfpendingswipe = 0;
 	}
 }
@@ -238,7 +321,7 @@ run()
 		die("Couldn't set mode to capture events");
 	}
 
-	// E.g. initially invalidate every slot 
+	// E.g. initially invalidate every slot
 	for (i = 0; i < MAXSLOTS; i++) {
 		xend[i] = NOMOTION;
 		yend[i] = NOMOTION;
@@ -266,7 +349,7 @@ run()
 	}
 	libinput_unref(li);
 }
- 
+
 int
 main(int argc, char *argv[])
 {
@@ -300,10 +383,10 @@ main(int argc, char *argv[])
 				exit(EXIT_FAILURE);
 			}
 			gestpt = strtok(argv[++i], ",");
-			for (j = 0; gestpt != NULL && j < 3;	gestpt = strtok(NULL, ","), j++) {
+			for (j = 0; gestpt != NULL && j < 4;	gestpt = strtok(NULL, ","), j++) {
 				switch(j) {
 					case 0: gestsarr[gestsarrlen - 1].nfswipe = atoi(gestpt); break;
-					case 1: 
+					case 1:
 						if (!strcmp(gestpt, "LR")) gestsarr[gestsarrlen-1].swipe = SwipeLR;
 						if (!strcmp(gestpt, "RL")) gestsarr[gestsarrlen-1].swipe = SwipeRL;
 						if (!strcmp(gestpt, "DU")) gestsarr[gestsarrlen-1].swipe = SwipeDU;
@@ -313,14 +396,30 @@ main(int argc, char *argv[])
 						if (!strcmp(gestpt, "ULDR")) gestsarr[gestsarrlen-1].swipe = SwipeULDR;
 						if (!strcmp(gestpt, "DRUL")) gestsarr[gestsarrlen-1].swipe = SwipeDRUL;
 						break;
-					case 2: gestsarr[gestsarrlen - 1].command = gestpt; break;
+					case 2:
+						if (!strcmp(gestpt, "L")) gestsarr[gestsarrlen-1].edge = LeftEdge;
+						if (!strcmp(gestpt, "R")) gestsarr[gestsarrlen-1].edge = RightEdge;
+						if (!strcmp(gestpt, "T")) gestsarr[gestsarrlen-1].edge = TopEdge;
+						if (!strcmp(gestpt, "B")) gestsarr[gestsarrlen-1].edge = BottomEdge;
+						if (!strcmp(gestpt, "TL")) gestsarr[gestsarrlen-1].edge = TopLeftCorner;
+						if (!strcmp(gestpt, "TR")) gestsarr[gestsarrlen-1].edge = TopRightCorner;
+						if (!strcmp(gestpt, "BL")) gestsarr[gestsarrlen-1].edge = BottomLeftCorner;
+						if (!strcmp(gestpt, "BR")) gestsarr[gestsarrlen-1].edge = BottomRightCorner;
+						if (!strcmp(gestpt, "N")) gestsarr[gestsarrlen-1].edge = NoEdge;
+						break;
+					case 3: gestsarr[gestsarrlen - 1].command = gestpt; break;
 				}
 			}
 		} else {
-			fprintf(stderr, "lisgd [-v] [-d /dev/input/0] [-o 0] [-t 200] [-r 20] [-m 400] [-g '1,LR,notify-send swiped left to right']\n");
+			fprintf(stderr, "lisgd [-v] [-d /dev/input/0] [-o 0] [-t 200] [-r 20] [-m 400] [-g '1,LR,L,notify-send swiped left to right from left edge']\n");
 			exit(1);
 		}
 	}
+
+	//get display size
+	screen = DefaultScreen(dpy);
+	screenwidth = DisplayWidth(dpy, screen);
+	screenheight = DisplayHeight(dpy, screen);
 
 	// E.g. no gestures passed on CLI - used gestures defined in config.def.h
 	if (gestsarrlen == 0) {
@@ -329,9 +428,11 @@ main(int argc, char *argv[])
 		memcpy(gestsarr, gestures, sizeof(gestures));
 	}
 
-  // Modify gestures swipes based on orientation provided
-	for (i = 0; i < gestsarrlen; i++)
+	// Modify gestures swipes based on orientation provided
+	for (i = 0; i < gestsarrlen; i++) {
 		gestsarr[i].swipe = swipereorient(gestsarr[i].swipe, orientation);
+		gestsarr[i].edge = edgereorient(gestsarr[i].edge, orientation);
+	}
 
 	run();
 	return 0;
