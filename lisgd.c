@@ -406,6 +406,7 @@ main(int argc, char *argv[])
 						if (!strcmp(gestpt, "BL")) gestsarr[gestsarrlen-1].edge = BottomLeftCorner;
 						if (!strcmp(gestpt, "BR")) gestsarr[gestsarrlen-1].edge = BottomRightCorner;
 						if (!strcmp(gestpt, "N")) gestsarr[gestsarrlen-1].edge = NoEdge;
+						if (!strcmp(gestpt, "A")) gestsarr[gestsarrlen-1].edge = AnyEdge;
 						break;
 					case 3: gestsarr[gestsarrlen - 1].command = gestpt; break;
 				}
