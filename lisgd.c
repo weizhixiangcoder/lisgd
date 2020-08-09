@@ -417,6 +417,8 @@ main(int argc, char *argv[])
 	}
 
 	//get display size
+	if (!(dpy = XOpenDisplay(0)))
+		die("cannot open display");
 	screen = DefaultScreen(dpy);
 	screenwidth = DisplayWidth(dpy, screen);
 	screenheight = DisplayHeight(dpy, screen);
